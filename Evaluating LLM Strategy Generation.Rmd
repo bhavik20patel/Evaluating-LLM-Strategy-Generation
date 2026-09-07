@@ -1,0 +1,372 @@
+---
+title: "Project: Evaluating LLM Strategy Generation via a Standardized R-Backtesting Framework"
+author: "Bhavik Patel"
+date: "2026-05-09"
+
+---
+
+
+```{r}
+################################################################################
+# PHASE 1: ENVIRONMENT SETUP & DATA ACQUISITION
+################################################################################
+
+# 1.1 Load Libraries
+# Using pacman to ensure all packages are installed and loaded automatically
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, tidyquant, PerformanceAnalytics, PortfolioAnalytics, 
+  ROI, ROI.plugin.quadprog, quadprog, zoo, ggplot2, tidyr, 
+  purrr, lubridate, readr, timetk, TTR
+)
+```
+
+```{r}
+# 1.2 Define Tickers and Timeframe
+# We use a broad range to cover both the 2022 crash and the 2023 recovery
+tickers <- c("SPY", "AGG", "BIL")
+start_date <- "2021-01-01"
+end_date   <- "2024-01-01"
+
+# 1.3 Download Data
+prices <- tq_get(tickers, from = start_date, to = end_date)
+
+# 1.4 Format Data for Portfolio Analysis
+# We need "Wide" format (tickers as columns) for the MPT and 60/40 benchmarking later
+prices_wide <- prices %>%
+  select(date, symbol, adjusted) %>%
+  pivot_wider(names_from = symbol, values_from = adjusted) %>%
+  tk_xts(date_var = date)
+
+returns_wide <- Return.calculate(prices_wide) %>% na.omit()
+
+```
+
+
+```{r}
+# Check the data
+print("--- First few rows of Returns Data ---")
+head(returns_wide)
+
+print("--- Data Summary ---")
+summary(returns_wide)
+
+```
+
+
+```{r}
+
+################################################################################
+# PHASE 2: STRATEGY LOGIC & BASELINE TESTING
+################################################################################
+
+# 2.1 Calculate CCI (AI Logic) and SMA (Human Benchmark)
+# We focus on SPY for this tactical test
+strategy_data <- prices %>%
+  filter(symbol == "SPY") %>%
+  # Adding CCI - Commodity Channel Index with a 100-period window as optimized in Phase 1
+  tq_mutate(select = c(high, low, close), mutate_fun = CCI, n = 100) %>%
+  # Adding 50-day SMA - Simple Moving Average as the human benchmark
+  tq_mutate(select = adjusted, mutate_fun = SMA, n = 50, col_rename = "sma_50")
+
+# 2.2 Generate Signals
+strategy_data <- strategy_data %>%
+  mutate(
+    # AI Logic: Buy when CCI < -100, Exit when CCI > 100
+    ai_raw_signal = case_when(
+      cci < -100 ~ 1,
+      cci > 100  ~ 0,
+      TRUE       ~ NA_real_
+    ),
+    # Use na.locf to "stay in the trade" until the exit signal is hit
+    ai_position = na.locf(ai_raw_signal, na.rm = FALSE) %>% replace_na(0),
+    
+    # Human Logic: Simple trend following (Buy if Price > SMA)
+    sma_position = ifelse(adjusted > sma_50, 1, 0)
+  )
+
+
+# 2.3 Calculate Returns
+
+bil_data <- tq_get("BIL", from = "2021-01-01", to = "2024-01-01") %>%
+  tq_transmute(select = adjusted, mutate_fun = periodReturn, period = "daily", col_rename = "bil_ret")
+
+# 2. Join the data and THEN calculate
+strategy_results <- strategy_data %>%
+  left_join(bil_data, by = "date") %>% # This is the critical alignment step
+  mutate(
+    daily_ret = log(adjusted / lag(adjusted)),
+    # Use your logic from before, now that bil_ret is available in the pipe
+    ai_strategy_ret = (lag(ai_position) * daily_ret) + ((1 - lag(ai_position)) * bil_ret),
+    human_sma_ret   = (lag(sma_position) * daily_ret) + ((1 - lag(sma_position)) * bil_ret)
+  ) %>% 
+  na.omit()
+
+```
+
+```{r}
+################################################################################
+# PHASE 3: MODERN PORTFOLIO THEORY & OPTIMIZATION
+################################################################################
+
+# 3.1 Dynamic Mean-Variance Optimization Function
+
+optimize_mpt_weights <- function(R_data) {
+  # Logic: Use expected return (mu) and covariance (sigma) (Req 2)
+  mu <- colMeans(R_data[, c("SPY", "AGG", "BIL")])
+  sigma <- cov(R_data[, c("SPY", "AGG", "BIL")])
+  n <- length(mu)
+  
+  # NEW: Dynamic target return based on 60/40 benchmark (Req 2)
+  w_bench <- c(0.60, 0.40, 0.00)
+  target_ret <- sum(mu * w_bench) 
+  
+  # Quadprog Solver Setup
+  Dmat <- sigma
+  dvec <- rep(0, n)
+  Amat <- cbind(rep(1, n), mu, diag(n))
+  bvec <- c(1, target_ret, rep(0, n))
+  
+  opt <- solve.QP(Dmat, dvec, Amat, bvec, meq = 2)
+  weights <- opt$solution
+  names(weights) <- names(mu)
+  return(weights)
+}
+
+mpt_weights <- optimize_mpt_weights(returns_wide)
+
+# 3.2 Define Benchmarks (Requirement 3)
+benchmark_weights <- c(SPY = 0.60, AGG = 0.40)
+
+```
+
+
+```{r}
+################################################################################
+# PHASE 4: THE REBALANCING ENGINE & MULTI-FREQUENCY TESTING
+################################################################################
+
+# 4.1 Execution Rules (Requirement 8)
+t_cost <- 0.001 # 10bps slippage/commissions 
+returns_xts <- as.xts(returns_wide[, c("SPY", "AGG", "BIL")])
+
+# 4.2 Multi-Frequency Rebalancing (Requirement 1)
+frequencies <- c("months", "quarters")
+all_rebalance_results <- list()
+
+#4.3 Weight Alignment & XTS Formatting
+
+# We repeat the optimized mpt_weights for every observation in the returns index
+weight_matrix <- matrix(
+  rep(mpt_weights, length(index(returns_xts))), 
+  nrow = length(index(returns_xts)), 
+  ncol = 3, 
+  byrow = TRUE
+)
+
+# Convert to xts to satisfy the Return.portfolio requirements
+mpt_weights_xts <- xts(weight_matrix, order.by = index(returns_xts))
+colnames(mpt_weights_xts) <- c("SPY", "AGG", "BIL")
+
+# 4.4 Execution Loop with Dynamic Friction
+for(freq in frequencies) {
+  
+  # Apply Portfolio Construction (Requirement 4)
+  # Using verbose = TRUE is critical to extract BOP/EOP weights for turnover
+  mpt_port_obj <- Return.portfolio(
+    R = returns_xts, 
+    weights = mpt_weights_xts, 
+    rebalance_on = freq, 
+    geometric = TRUE,
+    verbose = TRUE
+  )
+  
+  # Extract Gross Returns
+  gross_returns <- mpt_port_obj$returns
+  
+  # Calculate Turnover-Based Friction (Requirement 8)
+  # We calculate the absolute change in weights at each period to apply the 10bpscost
+  # This avoids the "static cost" error and matches the R-backtesting framework
+  turnover <- rowSums(abs(mpt_port_obj$BOP.Weight - lag(mpt_port_obj$EOP.Weight)), na.rm = TRUE)
+  
+# Net Return = Gross Return - (Turnover * Transaction Cost)
+  net_mpt <- gross_returns - (turnover * t_cost)
+  
+  # Store results in the list
+  all_rebalance_results[[paste0("MPT_", freq)]] <- net_mpt
+}
+
+# 4.5 Performance Consolidation
+# Merging all frequency results into a single object for Phase 5 Ranking
+portfolio_comparison <- do.call(merge, all_rebalance_results)
+colnames(portfolio_comparison) <- c("MPT_Monthly", "MPT_Quarterly")
+
+# Review the first few rows of net performance
+head(portfolio_comparison)
+
+```
+
+```{r}
+################################################################################
+# PHASE 5: AI STRATEGY ITERATION LOOP & FINAL COMPARISON
+################################################################################
+
+# 5.1 Define the AI Strategy Variants
+# This allows for easy adaptation of different prompts or lookback periods
+ai_variants <- list(
+  "AI_Aggressive"   = list(n = 20,  thresh = 100),
+  "AI_Standard"     = list(n = 100, thresh = 100),
+  "AI_Conservative" = list(n = 200, thresh = 150)
+)
+
+# 5.2 The Iteration Loop
+# We use a loop to backtest each variant and save the results for ranking
+ai_iteration_results <- list()
+
+# Re-isolating HLC data for the loop to ensure clean calculation
+spy_hlc <- prices %>% 
+  filter(symbol == "SPY") %>% 
+  select(high, low, close)
+
+for(name in names(ai_variants)) {
+  params <- ai_variants[[name]]
+  
+  # Calculate CCI as a numeric vector using the TTR package
+  cci_vec <- as.numeric(TTR::CCI(spy_hlc, n = params$n))
+  
+  # Signal Logic: Buy (1) when oversold, Exit (0) when overbought
+  sig <- case_when(
+    cci_vec < -params$thresh ~ 1,
+    cci_vec > params$thresh  ~ 0,
+    TRUE                     ~ NA_real_
+  )
+  
+  # Forward fill (Requirement 4) to "stay in the trade"
+  pos <- na.locf(sig, na.rm = FALSE)
+  pos[is.na(pos)] <- 0
+  pos_xts <- xts(pos, order.by = index(prices_wide))
+  
+  # Inside the Phase 5.2 loop
+  trades <- abs(pos_xts - Lag(pos_xts))
+  trades[1] <- 0 # Initialize first row
+  cost_penalty <- trades * t_cost
+  
+  # Calculate returns: Lagged Position * SPY Returns
+  # We use 'setNames' to ensure the column name matches the variant name
+  
+  strat_ret_net <- (Lag(pos_xts) * returns_xts[,"SPY"]) + ((1 - Lag(pos_xts)) * returns_xts[,"BIL"]) - Lag(cost_penalty)
+  strat_ret_net[1] <- 0 
+  strat_ret <- setNames(strat_ret_net, name)
+   
+  
+  ai_iteration_results[[name]] <- na.omit(strat_ret)
+}
+
+# 5.3 Merge AI Results
+final_ai_merged <- do.call(merge, ai_iteration_results)
+
+# 5.4 Merge with Professional Benchmark (MPT from Phase 4)
+# This fulfills the requirement to compare against a 60/40 benchmark
+final_comparison_all <- merge(final_ai_merged, portfolio_comparison$MPT_Monthly)
+
+# FIX: Dynamic naming to avoid 'dimnames' error
+names_from_loop <- names(ai_iteration_results)
+all_col_names <- c(names_from_loop, "MPT_Monthly")
+
+if(ncol(final_comparison_all) == length(all_col_names)) {
+  colnames(final_comparison_all) <- all_col_names
+}
+
+# 5.5 Final Performance Ranking (Requirement 7)
+print("--- FINAL STRATEGY RANKING (2021-2024) ---")
+
+# 1. Generate the standard returns table
+stats_table <- table.AnnualizedReturns(na.omit(final_comparison_all))
+
+# 2. Generate the Max Drawdown row specifically
+# we use na.omit to ensure the calculation is clean
+mdd_row <- maxDrawdown(na.omit(final_comparison_all))
+
+# 3. Combine them: rbind "glues" the new row to the bottom
+# We also give the new row a clean name
+rownames(mdd_row) <- "Max Drawdown"
+combined_results <- rbind(stats_table, mdd_row)
+
+# 4. Extract the Sharpe Ratio row (row 3) for the ranking logic
+sharpe_ratios <- as.numeric(stats_table[3, ])
+
+# 5. Reorder the columns of our NEW combined table based on those Sharpes
+ranked_stats <- combined_results[, order(sharpe_ratios, decreasing = TRUE)]
+
+# Now when you print, the 4th row will be Max Drawdown
+print(ranked_stats)
+
+# 5.6 Visual Comparison
+
+# Adjust margins to make room for labels (bottom, left, top, right)
+par(mar = c(8.2, 6, 4, 2))
+
+#Run plot with labels
+chart.CumReturns(na.omit(final_comparison_all), 
+                 main = "Final Outcome: Tactical AI Variants vs. Diversified MPT",
+                 legend.loc = "topleft", 
+                 colorset = rich8equal)
+
+title(xlab = "Time Period (2021-2024)", line = 6, cex.lab = 1.2)
+title(ylab = "Cumulative Log Returns", line = 4.7, cex.lab =1.2)
+                
+
+```
+
+```{r}
+################################################################################
+# PHASE 6: SENSITIVITY ANALYSIS - TRIGGER-BASED WEEKLY MONITORING
+################################################################################
+
+
+# 6.1 Define a 5% Tolerance Band (The "Threshold")
+# This addresses the professor's point: We monitor weekly, but only trade if 
+# an asset drifts by more than 5% from its target weight.
+threshold <- 0.05
+
+# 6.2 Execute Weekly Monitoring Logic
+mpt_weekly_obj <- Return.portfolio(
+  R = returns_xts, 
+  weights = mpt_weights_xts, 
+  rebalance_on = "weeks", # Monitor weekly
+  geometric = TRUE,
+  verbose = TRUE
+)
+
+# 6.3 Calculate "Smart" Turnover
+drift_raw <- mpt_weekly_obj$BOP.Weight - lag(mpt_weekly_obj$EOP.Weight)
+actual_drift <- na.omit(abs(drift_raw))
+
+# Convert to coredata for the logical check to avoid indexing errors
+# We check if the drift of ANY asset exceeds the 5% threshold
+drift_matrix <- coredata(actual_drift)
+smart_turnover_matrix <- ifelse(drift_matrix > threshold, drift_matrix, 0)
+
+# Condense into a single total turnover value per period
+total_smart_turnover <- rowSums(smart_turnover_matrix, na.rm = TRUE)
+
+# Re-align as an xts object using the indices from actual_drift
+total_smart_turnover_xts <- xts(total_smart_turnover, order.by = index(actual_drift))
+
+# 6.4 Calculate Net Performance
+# Subset the returns to match the dates where we have turnover data
+aligned_returns <- mpt_weekly_obj$returns[index(total_smart_turnover_xts)]
+net_mpt_weekly <- aligned_returns - (total_smart_turnover_xts * t_cost)
+colnames(net_mpt_weekly) <- "MPT_Weekly_Threshold"
+
+# 6.5 Final Sensitivity Comparison
+# We merge with na.omit to ensure all compared strategies share the same timeframe
+sensitivity_results <- table.AnnualizedReturns(na.omit(merge(portfolio_comparison, net_mpt_weekly)))
+print("--- REBALANCING SENSITIVITY ANALYSIS ---")
+print(sensitivity_results)
+
+```
+
+```{r}
+```
+
